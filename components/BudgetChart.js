@@ -6,7 +6,7 @@ function BudgetChart({ mode, income, expenses, allocation }) {
     const donutChartInstanceRef   = React.useRef(null);
 
     // FIX 1 — Guard props against undefined/null so the chart effect never
-    // receives bad data before Firestore has loaded.s
+    // receives bad data before Firestore has loaded.
     const safeIncome   = parseFloat(income) || 0;
     const safeExpenses = Array.isArray(expenses) ? expenses : [];
 
@@ -79,7 +79,7 @@ function BudgetChart({ mode, income, expenses, allocation }) {
       // with the app's primary red — replaced with distinct, accessible colors
       // matching BudgetBreakdownSimple's color scheme.
       const COLORS = {
-        Needs:   { bg: '#3B82F6', border: '#2563EB' }, // blue
+        Needs:   { bg: '#e63946', border: '#c1121f' }, // red
         Wants:   { bg: '#8B5CF6', border: '#7C3AED' }, // purple
         Others:  { bg: '#F59E0B', border: '#D97706' }, // amber
         Savings: { bg: '#10B981', border: '#059669' }, // green
@@ -235,7 +235,7 @@ function BudgetChart({ mode, income, expenses, allocation }) {
 
     // FIX 6 — Single source of truth for legend colors
     const legendItems = [
-      { color: '#3B82F6', label: 'Needs' },
+      { color: '#e63946', label: 'Needs' },
       { color: '#8B5CF6', label: 'Wants' },
       { color: '#F59E0B', label: 'Others' },
       { color: '#10B981', label: 'Savings' },
