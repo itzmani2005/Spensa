@@ -9,7 +9,6 @@ class ErrorBoundary extends React.Component {
   componentDidCatch(error, errorInfo) {
     console.error('ErrorBoundary caught an error:', error, errorInfo.componentStack);
   }
-
   render() {
     if (this.state.hasError) {
       return (
@@ -28,31 +27,132 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+// ── Session persistence helpers ───────────────────────────────────────────────
+// We store a lightweight session record in localStorage so the app can restore
+// the last active mode + month on startup without asking the user again.
+
+const SESSION_KEY = 'spensa_last_session';
+
+function saveSession(mode, month) {
+  try {
+    if (mode && month) {
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ mode, month }));
+    }
+  } catch (e) {}
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function App() {
   try {
-    const [mode, setMode] = React.useState(null);
-    const [currentMonth, setCurrentMonth] = React.useState(null);
-    const [income, setIncome] = React.useState(0);
-    const [allocation, setAllocation] = React.useState(null);
-    const [expenses, setExpenses] = React.useState([]);
-    const [goals, setGoals] = React.useState([]);
-    const [alert, setAlert] = React.useState(null);
+    const [mode, setMode]                     = React.useState(null);
+    const [currentMonth, setCurrentMonth]     = React.useState(null);
+    const [income, setIncome]                 = React.useState(0);
+    const [allocation, setAllocation]         = React.useState(null);
+    const [expenses, setExpenses]             = React.useState([]);
+    const [goals, setGoals]                   = React.useState([]);
+    const [alert, setAlert]                   = React.useState(null);
     const [currentSection, setCurrentSection] = React.useState('home');
-    const [loading, setLoading] = React.useState(false);
+    const [loading, setLoading]               = React.useState(false);
+    // sessionRestoring: true while we check for a saved session on startup.
+    // Keeps a blank screen from flashing before the session is restored.
+    const [sessionRestoring, setSessionRestoring] = React.useState(true);
 
+    // ── STARTUP: restore last session ─────────────────────────────────────────
+    // On mount, wait for Firebase auth to resolve then check if there is a
+    // saved session. If yes, restore mode + month + Firestore data automatically
+    // so the user lands back on their dashboard instead of the setup flow.
+    React.useEffect(() => {
+      let cancelled = false;
+
+      const restore = async () => {
+        // Wait up to 8 seconds for auth to resolve
+        const waitForUser = () => new Promise((resolve) => {
+          if (window.currentUser !== undefined && window.currentUser !== null) {
+            return resolve(window.currentUser);
+          }
+          const start = Date.now();
+          const iv = setInterval(() => {
+            if (window.currentUser) {
+              clearInterval(iv);
+              resolve(window.currentUser);
+            } else if (Date.now() - start > 8000) {
+              clearInterval(iv);
+              resolve(null);
+            }
+          }, 100);
+        });
+
+        const user = await waitForUser();
+
+        if (cancelled) return;
+
+        if (!user) {
+          // Not signed in — start fresh
+          setSessionRestoring(false);
+          return;
+        }
+
+        const session = loadSession();
+        if (!session || !session.mode || !session.month) {
+          // No previous session — show ModeSelector
+          setSessionRestoring(false);
+          return;
+        }
+
+        // We have a saved session — try to restore data from Firestore
+        try {
+          const data = await loadMonthFromFirestore(session.mode, session.month);
+          if (cancelled) return;
+
+          if (data && data.income > 0 && data.allocation) {
+            // Full session found — restore everything silently
+            setMode(session.mode);
+            setCurrentMonth(session.month);
+            setIncome(data.income);
+            setAllocation(data.allocation);
+            setExpenses(data.expenses || []);
+            setGoals(data.goals || []);
+            console.log(`Session restored: [${session.mode}] ${session.month}`);
+          } else {
+            // Session key exists but no valid Firestore data — start fresh
+            clearSession();
+          }
+        } catch (err) {
+          console.error('Session restore error:', err);
+          clearSession();
+        }
+
+        if (!cancelled) setSessionRestoring(false);
+      };
+
+      restore();
+      return () => { cancelled = true; };
+    }, []); // run once on mount only
+
+    // ── Load month data when mode + month are selected ────────────────────────
     const loadMonthDataFromFirestore = React.useCallback(async () => {
       setLoading(true);
       try {
-        const monthData = await loadMonthFromFirestore(currentMonth, mode);
-        // FIX 2 — only reset state when there is genuinely no cloud data at all.
-        // Previously this wiped goals/expenses whenever income happened to be 0.
-        if (monthData) {
-          setIncome(monthData.income || 0);
-          setAllocation(monthData.allocation || null);
-          setExpenses(monthData.expenses || []);
-          setGoals(monthData.goals || []);
+        const data = await loadMonthFromFirestore(mode, currentMonth);
+        if (data) {
+          setIncome(data.income || 0);
+          setAllocation(data.allocation || null);
+          setExpenses(data.expenses || []);
+          setGoals(data.goals || []);
         } else {
-          // No cloud document yet — start fresh for this month
           setIncome(0);
           setAllocation(null);
           setExpenses([]);
@@ -62,17 +162,25 @@ function App() {
         console.error('Error loading month data:', error);
       }
       setLoading(false);
-    }, [currentMonth, mode]); // only re-create when month or mode changes
+    }, [currentMonth, mode]);
 
-   
     React.useEffect(() => {
-      if (currentMonth && mode && window.currentUser) {
+      if (currentMonth && mode && window.currentUser && !sessionRestoring) {
         loadMonthDataFromFirestore();
       }
-    }, [currentMonth, mode, loadMonthDataFromFirestore]);
+    }, [currentMonth, mode, loadMonthDataFromFirestore, sessionRestoring]);
 
+    // ── Save session key whenever mode + month are confirmed ──────────────────
+    React.useEffect(() => {
+      if (mode && currentMonth) {
+        saveSession(mode, currentMonth);
+      }
+    }, [mode, currentMonth]);
+
+    // ── Auto-save when expenses or goals change ───────────────────────────────
     const isReadyToAutoSave =
       !loading &&
+      !sessionRestoring &&
       mode &&
       currentMonth &&
       income > 0 &&
@@ -83,7 +191,9 @@ function App() {
       if (!isReadyToAutoSave) return;
       saveMonthToFirestore(mode, currentMonth, income, allocation, expenses, goals)
         .catch(err => console.error('Auto-save failed:', err));
-    }, [expenses, goals]);
+    }, [expenses, goals]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
     const showAlert = (message, type = 'warning') => {
       setAlert({ message, type });
       setTimeout(() => setAlert(null), 5000);
@@ -99,22 +209,20 @@ function App() {
 
     const handleAddSavingExpense = async (amount, goalName) => {
       const newExpense = {
-        id: Date.now(),
-        name: `Savings for ${goalName}`,
+        id:       Date.now(),
+        name:     `Savings for ${goalName}`,
         category: 'Savings',
-        amount: parseFloat(amount),
-        date: new Date().toISOString()
+        amount:   parseFloat(amount),
+        date:     new Date().toISOString(),
       };
       const updatedExpenses = [newExpense, ...expenses];
       setExpenses(updatedExpenses);
-  
-      saveToStorage({ mode, currentMonth, income, expenses: updatedExpenses, goals });
-   
+      saveToStorage({ mode, currentMonth, income, allocation, expenses: updatedExpenses, goals });
       if (window.currentUser) {
         try {
           await saveMonthToFirestore(mode, currentMonth, income, allocation, updatedExpenses, goals);
         } catch (err) {
-          console.error('Failed to sync saving expense to Firestore:', err);
+          console.error('Failed to sync saving expense:', err);
         }
       }
     };
@@ -133,48 +241,103 @@ function App() {
       }
     };
 
+    // Goes back to ModeSelector and clears the saved session
     const handleGoToHome = async () => {
-      if (income > 0) {
-        saveToStorage({ mode, currentMonth, income, expenses, goals });
-        // FIX 4 — cloud save on navigate home
-        if (window.currentUser) {
-          try {
-            await saveMonthToFirestore(mode, currentMonth, income, allocation, expenses, goals);
-          } catch (err) {
-            console.error('Failed to save to Firestore on home navigation:', err);
-          }
+      if (income > 0 && window.currentUser && mode && currentMonth) {
+        try {
+          await saveMonthToFirestore(mode, currentMonth, income, allocation, expenses, goals);
+        } catch (err) {
+          console.error('Save on home navigation failed:', err);
         }
       }
+      // Clear session so next load starts from ModeSelector
+      clearSession();
       setMode(null);
       setCurrentMonth(null);
+      setIncome(0);
+      setAllocation(null);
+      setExpenses([]);
+      setGoals([]);
       setCurrentSection('home');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     };
 
     const handleChangeMode = () => {
+      clearSession();
       setMode(null);
+      setCurrentMonth(null);
+      setIncome(0);
+      setAllocation(null);
+      setExpenses([]);
+      setGoals([]);
       setCurrentSection('home');
     };
 
     const handleChangeMonth = () => {
+      // Keep mode but clear month and data
+      const savedMode = mode;
+      clearSession();
       setCurrentMonth(null);
+      setIncome(0);
+      setAllocation(null);
+      setExpenses([]);
+      setGoals([]);
       setCurrentSection('home');
+      // Restore mode so MonthSelector shows immediately
+      setMode(savedMode);
     };
+
+    // ── Routing ───────────────────────────────────────────────────────────────
+
+    // Show full-screen spinner while checking for a saved session on startup
+    if (sessionRestoring) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50">
+          <div className="text-center">
+            <div
+              style={{
+                width: '48px', height: '48px', margin: '0 auto 16px',
+                border: '4px solid #f3f3f3',
+                borderTop: '4px solid #e63946',
+                borderRadius: '50%',
+                animation: 'spin 0.8s linear infinite',
+              }}
+            ></div>
+            <p className="text-gray-500 text-sm">Loading your session...</p>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          </div>
+        </div>
+      );
+    }
 
     if (!mode) {
       return <ModeSelector onSelectMode={setMode} />;
     }
 
     if (mode === 'expected') {
-      return <ExpectedBudget onBack={() => setMode(null)} />;
+      return <ExpectedBudget onBack={() => { clearSession(); setMode(null); }} />;
     }
 
     if (!currentMonth) {
-      return <MonthSelector onSelectMonth={setCurrentMonth} onBack={() => setMode(null)} mode={mode} />;
+      return (
+        <MonthSelector
+          onSelectMonth={setCurrentMonth}
+          onBack={() => { clearSession(); setMode(null); }}
+          mode={mode}
+        />
+      );
     }
 
     if (income === 0) {
-      return <IncomeInput mode={mode} onSetIncome={setIncome} onBack={() => setCurrentMonth(null)} />;
+      return (
+        <IncomeInput
+          mode={mode}
+          onSetIncome={setIncome}
+          onBack={() => setCurrentMonth(null)}
+        />
+      );
     }
+
     if (loading) {
       return (
         <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -187,25 +350,44 @@ function App() {
     }
 
     if (!allocation) {
-      return <AllocationSelector mode={mode} income={income} onSetAllocation={setAllocation} onBack={() => setIncome(0)} />;
+      return (
+        <AllocationSelector
+          mode={mode}
+          income={income}
+          onSetAllocation={setAllocation}
+          onBack={() => setIncome(0)}
+        />
+      );
     }
 
     return (
       <div className="min-h-screen bg-gray-50" data-name="app" data-file="app.js">
         {alert && <Alert message={alert.message} type={alert.type} onClose={() => setAlert(null)} />}
-        
-        <Navbar currentSection={currentSection} onNavigate={handleNavigate} />
-        
+
+        <Navbar
+          currentSection={currentSection}
+          onNavigate={handleNavigate}
+          onGoHome={handleGoToHome}
+        />
+
         <div className="bg-white shadow-sm py-3 sticky top-16 z-40">
           <div className="max-w-7xl mx-auto px-4 flex items-center justify-between">
             <p className="text-sm text-gray-600">
-              <span className="font-semibold">{currentMonth}</span> • <span className="capitalize">{mode} Mode</span>
+              <span className="font-semibold">{currentMonth}</span>
+              {' • '}
+              <span className="capitalize">{mode} Mode</span>
             </p>
             <div className="flex items-center gap-3">
-              <button onClick={handleChangeMonth} className="text-sm text-gray-600 hover:text-[var(--primary-color)] font-medium">
+              <button
+                onClick={handleChangeMonth}
+                className="text-sm text-gray-600 hover:text-[var(--primary-color)] font-medium transition-colors"
+              >
                 Change Month
               </button>
-              <button onClick={handleChangeMode} className="text-sm text-gray-600 hover:text-[var(--primary-color)] font-medium">
+              <button
+                onClick={handleChangeMode}
+                className="text-sm text-gray-600 hover:text-[var(--primary-color)] font-medium transition-colors"
+              >
                 Change Mode
               </button>
             </div>
@@ -230,7 +412,7 @@ function App() {
           </div>
           <BudgetChart mode={mode} income={income} expenses={expenses} allocation={allocation} />
           <MonthlyOverview expenses={expenses} />
-          
+
           <div className="card text-center">
             <div className="flex flex-col sm:flex-row gap-3 justify-center">
               <button onClick={handleManualSave} className="btn-primary">
@@ -246,7 +428,7 @@ function App() {
                 </div>
               </button>
             </div>
-            <p className="text-sm text-gray-500 mt-3">Save your data or return to the top of the page</p>
+            <p className="text-sm text-gray-500 mt-3">Save your data or go back to the home page</p>
           </div>
         </main>
       </div>
