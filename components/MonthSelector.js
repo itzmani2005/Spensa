@@ -28,7 +28,7 @@ function MonthSelector({ onSelectMonth, onBack, mode }) {
       setError('');
       try {
         const [firestoreMonths, localMonths] = await Promise.all([
-          getAllMonthsFromFirestore().catch(() => []),
+          getAllMonthsFromFirestore(mode).catch(() => []),
           Promise.resolve(getAllMonths(mode)),
         ]);
         const merged = [...new Set([...firestoreMonths, ...localMonths])];
@@ -93,7 +93,7 @@ function MonthSelector({ onSelectMonth, onBack, mode }) {
     const handleDeleteConfirm = async () => {
       try {
         await Promise.all([
-          deleteMonthFromFirestore(deleteModal.month).catch(err =>
+          deleteMonthFromFirestore(mode, deleteModal.month).catch(err =>
             console.error('Firestore delete error:', err)
           ),
           Promise.resolve(deleteMonthData(deleteModal.month, mode)),
@@ -148,7 +148,7 @@ function MonthSelector({ onSelectMonth, onBack, mode }) {
           );
         }
         await Promise.all([
-          deleteMonthFromFirestore(editModal.month).catch(() => {}),
+          deleteMonthFromFirestore(mode, editModal.month).catch(() => {}),
           Promise.resolve(deleteMonthData(editModal.month, mode)),
         ]);
 
