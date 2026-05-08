@@ -1,9 +1,9 @@
 // ============================================================
-// firestoreSync.js — Fixed
-// KEY FIX: mode is now included in the Firestore document key
-// so Student and Professional data are stored separately.
-// Document path: users/{uid}/months/{mode}_{monthKey}
-// e.g. student_March-2026  vs  professional_March-2026
+// firestoreSync.js
+// Handles both old-format keys (March-2026) and new-format
+// keys (student_March-2026) so past data is never lost.
+// Migrates old docs to new format automatically on first load.
+// Data is always scoped to the signed-in user's uid.
 // ============================================================
 
 const MAX_RETRIES    = 3;
@@ -47,8 +47,7 @@ async function getFirestoreFns() {
     if (Date.now() - start > 5000) {
       throw new Error(
         'Firestore functions not found on window.firestoreFns. ' +
-        'Make sure index.html imports all Firestore functions in its ' +
-        '<script type="module"> block and assigns them to window.firestoreFns.'
+        'Make sure index.html imports Firestore functions and assigns them to window.firestoreFns.'
       );
     }
     await new Promise(r => setTimeout(r, 50));
@@ -67,22 +66,27 @@ async function withRetry(fn, retries = MAX_RETRIES) {
         err.code === 'deadline-exceeded' ||
         err.message?.includes('network');
       if (isLast || !isTransient) throw err;
-      console.warn(`Firestore attempt ${attempt} failed, retrying in ${RETRY_DELAY_MS}ms...`, err.code);
+      console.warn(`Firestore attempt ${attempt} failed, retrying...`, err.code);
       await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
     }
   }
 }
 
-// ── THE CORE FIX ──────────────────────────────────────────────────────────────
-// Before: key = "March-2026"  (same for ALL modes — data was shared)
-// After:  key = "student_March-2026"  OR  "professional_March-2026"
-// Each mode now has its own completely separate Firestore document.
+// ── Key helpers ───────────────────────────────────────────────────────────────
+
+// New format: "student_March-2026"
 function buildDocKey(mode, month) {
   const safeMode  = (mode  || 'unknown').toLowerCase().replace(/\s+/g, '-');
   const safeMonth = (month || '').replace(/\s+/g, '-');
   return `${safeMode}_${safeMonth}`;
 }
-// ─────────────────────────────────────────────────────────────────────────────
+
+// Old format (saved before mode isolation): "March-2026"
+function buildOldDocKey(month) {
+  return (month || '').replace(/\s+/g, '-');
+}
+
+// ── Ref helpers ───────────────────────────────────────────────────────────────
 
 async function getMonthRef(mode, month) {
   const [user, db, { doc }] = await Promise.all([
@@ -90,8 +94,55 @@ async function getMonthRef(mode, month) {
     waitForDb(),
     getFirestoreFns(),
   ]);
-  const docKey = buildDocKey(mode, month);
-  return { ref: doc(db, 'users', user.uid, 'months', docKey), user };
+  return { ref: doc(db, 'users', user.uid, 'months', buildDocKey(mode, month)), user, db };
+}
+
+async function getOldMonthRef(month) {
+  const [user, db, { doc }] = await Promise.all([
+    waitForAuth(),
+    waitForDb(),
+    getFirestoreFns(),
+  ]);
+  return { ref: doc(db, 'users', user.uid, 'months', buildOldDocKey(month)), user, db };
+}
+
+// ── Migration ─────────────────────────────────────────────────────────────────
+// Copies an old-format document to the new mode-prefixed key,
+// then deletes the old document. Called automatically when old data is found.
+
+async function migrateOldDoc(oldData, mode, month) {
+  try {
+    const [user, db, { doc, setDoc, deleteDoc, serverTimestamp }] = await Promise.all([
+      waitForAuth(),
+      waitForDb(),
+      getFirestoreFns(),
+    ]);
+
+    const newKey = buildDocKey(mode, month);
+    const oldKey = buildOldDocKey(month);
+
+    // Don't migrate if already using new key
+    if (newKey === oldKey) return;
+
+    const newRef = doc(db, 'users', user.uid, 'months', newKey);
+    const oldRef = doc(db, 'users', user.uid, 'months', oldKey);
+
+    // Write to new key with mode field added
+    await setDoc(newRef, {
+      ...oldData,
+      mode,
+      userId:       user.uid,
+      updatedAt:    serverTimestamp(),
+      updatedAtISO: new Date().toISOString(),
+    }, { merge: false });
+
+    // Remove old key
+    await deleteDoc(oldRef);
+    console.log(`Migrated: ${oldKey} → ${newKey}`);
+  } catch (err) {
+    // Migration is non-fatal — old data stays accessible
+    console.warn('Migration skipped:', err.message);
+  }
 }
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -115,7 +166,7 @@ async function saveMonthToFirestore(mode, month, income, allocation, expenses, g
       }, { merge: true })
     );
 
-    console.log(`Saved to Firestore: [${mode}] ${month}`);
+    console.log(`Saved: [${mode}] ${month}`);
   } catch (error) {
     console.error('Error saving to Firestore:', error);
     throw error;
@@ -125,25 +176,41 @@ async function saveMonthToFirestore(mode, month, income, allocation, expenses, g
 async function loadMonthFromFirestore(mode, month) {
   try {
     const { ref, user } = await getMonthRef(mode, month);
-    const { getDoc } = await getFirestoreFns();
+    const { getDoc }    = await getFirestoreFns();
 
-    const snap = await withRetry(() => getDoc(ref));
-    if (!snap.exists()) return null;
-
-    const data = snap.data();
-    if (data.userId !== user.uid) {
-      console.error('userId mismatch - discarding document');
-      return null;
+    // 1. Try new key first: "student_March-2026"
+    const newSnap = await withRetry(() => getDoc(ref));
+    if (newSnap.exists()) {
+      const data = newSnap.data();
+      if (data.userId === user.uid) return data;
     }
 
-    return data;
+    // 2. Fallback: try old key "March-2026" (data saved before mode isolation)
+    const { ref: oldRef } = await getOldMonthRef(month);
+    const oldSnap = await withRetry(() => getDoc(oldRef));
+
+    if (oldSnap.exists()) {
+      const oldData = oldSnap.data();
+      if (oldData.userId === user.uid) {
+        console.log(`Found old-format data for ${month} — migrating...`);
+        // Migrate in background so load isn't blocked
+        migrateOldDoc(oldData, mode, month);
+        return { ...oldData, mode };
+      }
+    }
+
+    return null;
   } catch (error) {
     console.error('Error loading from Firestore:', error);
     return null;
   }
 }
 
-// Returns only months that belong to the given mode
+// Gets all months for the current user+mode.
+// Strategy:
+//   1. Try compound query (requires Firestore index) — fast and mode-filtered
+//   2. If index missing, fall back to full collection scan + filter in JS
+//   3. Also scan for old-format docs (no mode prefix) and include them
 async function getAllMonthsFromFirestore(mode) {
   try {
     const [user, db, fns] = await Promise.all([
@@ -153,24 +220,70 @@ async function getAllMonthsFromFirestore(mode) {
     ]);
     const { collection, getDocs, query, orderBy, where } = fns;
 
-    const monthsRef = collection(db, 'users', user.uid, 'months');
-    // Filter by mode field so Student months never appear in Professional list
-    const q = query(
-      monthsRef,
-      where('mode', '==', mode || ''),
-      orderBy('updatedAt', 'desc')
-    );
-    const snapshot = await withRetry(() => getDocs(q));
+    const monthsRef  = collection(db, 'users', user.uid, 'months');
+    const monthSet   = new Map(); // month name → updatedAt (for dedup + sort)
 
-    const months = [];
-    snapshot.forEach(docSnap => {
-      const data = docSnap.data();
-      if (data.userId === user.uid && data.month && data.mode === mode) {
-        months.push(data.month);
-      }
+    // ── Strategy 1: compound query (needs composite index) ──────────────────
+    let compoundOk = false;
+    try {
+      const q        = query(monthsRef, where('mode', '==', mode || ''), orderBy('updatedAt', 'desc'));
+      const snapshot = await withRetry(() => getDocs(q));
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        if (data.userId === user.uid && data.month) {
+          monthSet.set(data.month, data.updatedAtISO || '');
+        }
+      });
+      compoundOk = true;
+      console.log(`Compound query found ${monthSet.size} months for [${mode}]`);
+    } catch (indexErr) {
+      // Index not ready yet — fall through to full scan
+      console.warn('Compound query failed (index may not exist yet), using full scan:', indexErr.message);
+    }
+
+    // ── Strategy 2: full collection scan (no index needed) ──────────────────
+    // Always run this to catch old-format docs that have no mode field.
+    try {
+      const allSnap = await withRetry(() => getDocs(query(monthsRef, orderBy('updatedAtISO', 'desc'))));
+      allSnap.forEach(docSnap => {
+        const data   = docSnap.data();
+        const docId  = docSnap.id;
+        if (data.userId !== user.uid || !data.month) return;
+
+        // Include if:
+        // (a) doc has matching mode field  OR
+        // (b) doc has no mode field (old format) — belongs to this user and we show it
+        const docMode     = data.mode || null;
+        const isNewFormat = docId.startsWith(mode.toLowerCase() + '_');
+        const isOldFormat = !docMode && !docId.includes('_');
+        const isSameMode  = docMode === mode;
+
+        if (isNewFormat || isSameMode || isOldFormat) {
+          if (!monthSet.has(data.month)) {
+            monthSet.set(data.month, data.updatedAtISO || '');
+          }
+        }
+      });
+    } catch (scanErr) {
+      console.warn('Full scan fallback also failed:', scanErr.message);
+      // If both strategies fail, return empty — do not crash
+      if (!compoundOk) return [];
+    }
+
+    // Sort newest first
+    const months = [...monthSet.keys()].sort((a, b) => {
+      const MONTHS = ['January','February','March','April','May','June',
+                      'July','August','September','October','November','December'];
+      const parse  = str => {
+        const [m, y] = (str || '').split(' ');
+        return new Date(parseInt(y) || 0, MONTHS.indexOf(m));
+      };
+      return parse(b) - parse(a);
     });
 
+    console.log(`getAllMonthsFromFirestore [${mode}]: found ${months.length} months`);
     return months;
+
   } catch (error) {
     console.error('Error getting months from Firestore:', error);
     return [];
@@ -179,11 +292,30 @@ async function getAllMonthsFromFirestore(mode) {
 
 async function deleteMonthFromFirestore(mode, month) {
   try {
-    const { ref } = await getMonthRef(mode, month);
-    const { deleteDoc } = await getFirestoreFns();
+    const [user, db, { doc, deleteDoc, getDoc }] = await Promise.all([
+      waitForAuth(),
+      waitForDb(),
+      getFirestoreFns(),
+    ]);
 
-    await withRetry(() => deleteDoc(ref));
-    console.log(`Deleted from Firestore: [${mode}] ${month}`);
+    const newKey = buildDocKey(mode, month);
+    const oldKey = buildOldDocKey(month);
+
+    const newRef = doc(db, 'users', user.uid, 'months', newKey);
+    const oldRef = doc(db, 'users', user.uid, 'months', oldKey);
+
+    // Delete both new and old format keys so nothing is left behind
+    const [newSnap, oldSnap] = await Promise.all([
+      getDoc(newRef).catch(() => null),
+      getDoc(oldRef).catch(() => null),
+    ]);
+
+    const deletes = [];
+    if (newSnap?.exists()) deletes.push(deleteDoc(newRef));
+    if (oldSnap?.exists() && oldKey !== newKey) deletes.push(deleteDoc(oldRef));
+
+    await Promise.all(deletes);
+    console.log(`Deleted: [${mode}] ${month}`);
     return true;
   } catch (error) {
     console.error('Error deleting from Firestore:', error);
@@ -211,9 +343,7 @@ async function startRealtimeSync(mode, month, onUpdate) {
         if (data.userId !== user.uid) return;
         onUpdate(data);
       },
-      (error) => {
-        console.error('Real-time sync error:', error);
-      }
+      (err) => console.error('Real-time sync error:', err)
     );
 
     _unsubscribeListeners[listenerKey] = unsubscribe;
@@ -235,11 +365,12 @@ function stopAllRealtimeSync() {
     _unsubscribeListeners[key]();
     delete _unsubscribeListeners[key];
   });
+  _unsubscribeListeners = {};
 }
 
 async function syncAllOnLogin(mode, onMonthLoaded) {
   try {
-    console.log(`Starting full sync for mode: ${mode}...`);
+    console.log(`Starting sync for [${mode}]...`);
     const months = await getAllMonthsFromFirestore(mode);
 
     for (const month of months) {
