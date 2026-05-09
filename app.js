@@ -69,6 +69,9 @@ function App() {
     // sessionRestoring: true while we check for a saved session on startup.
     // Keeps a blank screen from flashing before the session is restored.
     const [sessionRestoring, setSessionRestoring] = React.useState(true);
+    const [editIncomeModal, setEditIncomeModal] = React.useState(false);
+    const [editIncomeValue, setEditIncomeValue] = React.useState('');
+    const [editIncomeError, setEditIncomeError] = React.useState('');
 
     // ── STARTUP: restore last session ─────────────────────────────────────────
     // On mount, wait for Firebase auth to resolve then check if there is a
@@ -241,6 +244,51 @@ function App() {
       }
     };
 
+    // ── EDIT INCOME ───────────────────────────────────────────────────────────
+    const handleOpenEditIncome = () => {
+      setEditIncomeValue(String(income));
+      setEditIncomeError('');
+      setEditIncomeModal(true);
+    };
+
+    const handleConfirmEditIncome = async () => {
+      const parsed = parseFloat(editIncomeValue);
+      if (!editIncomeValue || isNaN(parsed) || parsed <= 0) {
+        setEditIncomeError('Please enter a valid income amount greater than 0.');
+        return;
+      }
+      if (parsed === income) {
+        setEditIncomeModal(false);
+        return;
+      }
+      // Update income in state — allocation percentages stay the same,
+      // the amounts will recompute automatically via AllocationSelector logic.
+      const newAllocation = allocation ? {
+        ...allocation,
+        needsAmount:   (allocation.needs   / 100) * parsed,
+        wantsAmount:   (allocation.wants   / 100) * parsed,
+        othersAmount:  (allocation.others  / 100) * parsed,
+        savingsAmount: (allocation.savings / 100) * parsed,
+      } : allocation;
+
+      setIncome(parsed);
+      if (newAllocation) setAllocation(newAllocation);
+      setEditIncomeModal(false);
+      setEditIncomeError('');
+
+      // Save updated income to Firestore immediately
+      if (window.currentUser) {
+        try {
+          await saveMonthToFirestore(mode, currentMonth, parsed, newAllocation, expenses, goals);
+          showAlert('Income updated and saved!', 'success');
+        } catch (err) {
+          console.error('Failed to save updated income:', err);
+          showAlert('Income updated locally but failed to sync.', 'warning');
+        }
+      }
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Goes back to ModeSelector and clears the saved session
     const handleGoToHome = async () => {
       if (income > 0 && window.currentUser && mode && currentMonth) {
@@ -364,6 +412,80 @@ function App() {
       <div className="min-h-screen bg-gray-50" data-name="app" data-file="app.js">
         {alert && <Alert message={alert.message} type={alert.type} onClose={() => setAlert(null)} />}
 
+        {/* Edit Income Modal */}
+        {editIncomeModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}
+            onClick={() => setEditIncomeModal(false)}
+          >
+            <div
+              className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xl font-bold">Edit Monthly Income</h3>
+                <button
+                  onClick={() => setEditIncomeModal(false)}
+                  className="text-gray-400 hover:text-gray-600 transition-colors"
+                >
+                  <div className="icon-x text-xl"></div>
+                </button>
+              </div>
+
+              <p className="text-sm text-gray-500 mb-1">Current income</p>
+              <p className="text-2xl font-bold mb-4" style={{ color: 'var(--primary-color)' }}>
+                {formatCurrency(income)}
+              </p>
+
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                New Income Amount
+              </label>
+
+              {editIncomeError && (
+                <div className="text-sm bg-red-50 text-red-600 rounded-lg px-3 py-2 mb-3 flex items-center gap-2">
+                  <div className="icon-circle-alert text-xs flex-shrink-0"></div>
+                  <span>{editIncomeError}</span>
+                </div>
+              )}
+
+              <input
+                type="number"
+                value={editIncomeValue}
+                onChange={e => { setEditIncomeValue(e.target.value); setEditIncomeError(''); }}
+                onKeyDown={e => e.key === 'Enter' && handleConfirmEditIncome()}
+                placeholder="Enter new income"
+                min="1"
+                step="0.01"
+                autoFocus
+                className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none transition-colors mb-2"
+                style={{ borderColor: editIncomeError ? '#e63946' : '' }}
+                onFocus={e => e.target.style.borderColor = '#e63946'}
+                onBlur={e => e.target.style.borderColor = editIncomeError ? '#e63946' : '#e5e7eb'}
+              />
+
+              <p className="text-xs text-gray-400 mb-4">
+                Budget percentages stay the same — only the amounts will update.
+              </p>
+
+              <div className="flex gap-3">
+                <button onClick={handleConfirmEditIncome} className="btn-primary flex-1">
+                  <div className="flex items-center justify-center gap-2">
+                    <div className="icon-check text-sm"></div>
+                    <span>Update Income</span>
+                  </div>
+                </button>
+                <button
+                  onClick={() => { setEditIncomeModal(false); setEditIncomeError(''); }}
+                  className="btn-secondary flex-1"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <Navbar
           currentSection={currentSection}
           onNavigate={handleNavigate}
@@ -378,6 +500,15 @@ function App() {
               <span className="capitalize">{mode} Mode</span>
             </p>
             <div className="flex items-center gap-3">
+              <button
+                onClick={handleOpenEditIncome}
+                className="text-sm font-medium transition-colors flex items-center gap-1"
+                style={{ color: 'var(--primary-color)' }}
+                title="Edit monthly income"
+              >
+                <div className="icon-pencil text-xs"></div>
+                <span>Edit Income</span>
+              </button>
               <button
                 onClick={handleChangeMonth}
                 className="text-sm text-gray-600 hover:text-[var(--primary-color)] font-medium transition-colors"
